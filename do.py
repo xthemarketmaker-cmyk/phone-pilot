@@ -2,6 +2,9 @@
 """do.py - generic fast iPhone primitives for tasks nobody scripted. One Shell call -> one JSON line.
   do.py [--phone 17|14] [--home] [--allow-risky] CMD ARGS...
   do.py [--phone 17] chain "open settings; tap_label General; tap_label About; read --contains iOS"
+Quoting: ';' inside quotes ("type 'a; b'") or written as \\; does not split a chain. `--` ends flags. type takes its
+  text literally (only --clear / --enter are flags, so "-5 deg" and "well - ok" type as written). type --clear alone
+  just empties the field. A chain stops at the first failed step but still goes Home if it ends with home.
 Commands: open APP|BUNDLE, open_url URL, tap_label TEXT [--nth N] [--type T] [--timeout S], tap X Y,
   type TEXT [--clear] [--enter], read [--contains S] [--limit N] [--no-rects] [--xml] [--all], wait_for TEXT [--timeout S],
   back, scroll up|down [--px N], home, wait MS, tap_rel FX FY, tap_nth TYPE N, dismiss, hide_keyboard, shot PATH, close_tab (the Safari tab open_url opened; open_url reuses it)
@@ -443,6 +446,10 @@ class Do:
 
     def c_type(self, a):
         text = " ".join(a.rest)
+        if text in ('""', "''"):   # PowerShell quoting leftovers (type '""' --clear): the owner meant "no text"
+            text = ""
+        if not text and not a.clear:
+            raise Fail("type needs text (or --clear to empty the field)")
         app = self.p.active()
         if a.enter and app in CHAT_APPS and not self.allow:
             raise Fail("--enter refused in a messaging app (could send)")
@@ -466,15 +473,27 @@ class Do:
                 eid = None
         if eid and self.p.attr(eid, "type") == "XCUIElementTypeSecureTextField":
             raise Fail("refusing to type into a password field")
+        ph = None
         if a.clear and eid:
             v = self.p.attr(eid, "value") or ""
-            if v:
+            try:
+                ph = self.p.attr(eid, "placeholderValue") or None
+            except Exception:
+                ph = None
+            if v and v != ph:
                 self.p.keys("\b" * (len(v) + 2))
-        self.p.keys(text)
+        if text:
+            self.p.keys(text)
         v = (self.p.attr(eid, "value") or "") if eid else None
         if a.enter:
             self.p.keys("\n")
             self.settle("", 2.0)
+        if not text:   # clear only: verified when the field is empty (or shows just its placeholder)
+            if eid and v not in ("", ph):   # the value attribute can lag the last backspaces by a moment
+                got = self.p.until(lambda: (lambda z: [z] if z in ("", ph) else None)(self.p.attr(eid, "value") or ""), 1.5, 0.1)
+                v = got[0] if got else (self.p.attr(eid, "value") or "")
+            empty = v is not None and v in ("", ph)
+            return {"ok": v is None or empty, "verified": empty, "cleared": True, **({} if empty or v is None else {"left": v[:40]})}
         return {"ok": v is None or text in v, "verified": v is not None and text in v}
 
     def c_read(self, a):
@@ -656,8 +675,64 @@ class Do:
         return {"ok": True}
 
 
+class StepParser(argparse.ArgumentParser):
+    def error(self, message):   # never print usage + SystemExit(2): that skipped the JSON line and the go-Home
+        raise Fail("bad step: " + message)
+
+
+def split_chain(s):
+    """split a chain on ';' but not inside quotes, and not when written as \\;. A quote only opens at the start of a
+    word, so an apostrophe inside a label (What's new) is plain text. An unclosed quote: split on every bare ';'."""
+    steps, cur, q, i = [], [], None, 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s) and s[i + 1] == ";":
+            cur.append(";"); i += 2; continue
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "'\"" and (not cur or cur[-1].isspace()):
+            q = ch
+        elif ch == ";":
+            steps.append("".join(cur)); cur = []; i += 1; continue
+        cur.append(ch); i += 1
+    if q:   # unbalanced quote: old behaviour (split on every ';' not escaped)
+        return [x.replace("\x00", ";") for x in s.replace("\\;", "\x00").split(";")]
+    steps.append("".join(cur))
+    return steps
+
+
+def split_step(s):
+    """one step's words. Backslashes stay literal (Windows paths: shot C:\\phonebot\\logs\\s.png); an apostrophe in a
+    label ("What's new") falls back to plain whitespace splitting."""
+    try:
+        lx = shlex.shlex(s, posix=True)
+        lx.whitespace_split, lx.escape, lx.commenters = True, "", ""
+        return list(lx)
+    except ValueError:
+        return s.split()
+
+
+def parse_step(sp, s):
+    """argparse for every command, except type: its text is literal. Only --clear / --enter (anywhere) are flags,
+    `--` ends flags, everything else (-5 deg, well - ok, --x) is text."""
+    if s and s[0] == "type":
+        a = sp.parse_args(["type"])
+        words, flags = [], True
+        for w in s[1:]:
+            if flags and w == "--":
+                flags = False
+            elif flags and w in ("--clear", "--enter"):
+                setattr(a, w[2:], True)
+            else:
+                words.append(w)
+        a.rest = words
+        return a
+    return sp.parse_args(s)
+
+
 def parser():
-    sp = argparse.ArgumentParser(prog="step", add_help=False)
+    sp = StepParser(prog="step", add_help=False)
     sp.add_argument("cmd")
     sp.add_argument("rest", nargs="*")
     sp.add_argument("--nth", type=int, default=1)
@@ -692,17 +767,15 @@ def main():
     if not argv:
         print(__doc__); sys.exit(2)
     if argv[0] == "chain":
-        def split(s):   # an apostrophe in a label ("What's new") must not kill the whole chain
-            try:
-                return shlex.split(s)
-            except ValueError:
-                return s.split()
-        steps = [split(s) for s in " ".join(argv[1:]).split(";") if s.strip()]
+        steps = [split_step(s) for s in split_chain(" ".join(argv[1:])) if s.strip()]
+        steps = [s for s in steps if s]
     else:
         steps = [argv]
     sp = parser()
     res = {"ok": True, "steps": []}
     d = None
+    ends_home = len(steps) > 1 and steps[-1][:1] == ["home"]   # "stops at the first failed step but still goes Home"
+    started = home_done = False
     try:
         for s in steps:   # owner's blocked apps: refuse the whole chain before touching the phone
             if s and s[0] == "open":
@@ -711,22 +784,23 @@ def main():
         d = Do(g["phone"], g["allow"])
         if d.p.locked():
             raise Fail("phone is locked")
-        for s in steps:
+        started = True   # from here on a failure still honours a final `home`
+        for i, s in enumerate(steps):
             t = time.time()
-            a = sp.parse_args(s)
-            fn = getattr(d, "c_" + a.cmd, None)
-            if not fn:
-                raise Fail("unknown command '%s'" % a.cmd)
             try:
+                a = parse_step(sp, s)
+                fn = getattr(d, "c_" + a.cmd, None)
+                if not fn:
+                    raise Fail("unknown command '%s'" % a.cmd)
                 r = fn(a)
             except Exception as e:
                 r = {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:160])}
             r = dict({"cmd": " ".join(s)[:60]}, **r, ms=int((time.time() - t) * 1000))
             res["steps"].append(r)
+            if s[:1] == ["home"] and r.get("ok"):
+                home_done = True
             if not r.get("ok"):
                 res["ok"] = False
-                if any(x and x[0] == "home" for x in steps[steps.index(s) + 1:]):
-                    g["home"] = True      # the chain ends at Home: still go there after a failure
                 break
     except Exception as e:
         res["ok"] = False
@@ -734,8 +808,14 @@ def main():
     finally:
         if d:
             try:
-                if g["home"]:
-                    d.p.home()
+                if g["home"] or (started and ends_home and not home_done and not res["ok"]):
+                    try:
+                        d.p.home()
+                        if not g["home"]:   # the chain's own final home, done after a failed step
+                            res["went_home"] = bool(d.p.until(lambda: d.p.active() == "com.apple.springboard", 6, 0.1))
+                    except Exception as e:
+                        res["went_home"] = False
+                        res["home_error"] = "%s: %s" % (type(e).__name__, str(e)[:100])
             finally:
                 d.close()
                 d.p.restore()
