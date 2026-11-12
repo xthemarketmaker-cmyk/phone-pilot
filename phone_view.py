@@ -96,7 +96,7 @@ btn("Apps", {"type": "apps"})
 if ph["kind"] == "android":
     btn("Back", {"type": "key", "key": "BACK"})
 badge = tk.Label(bar, bg="#1d6fe0", fg="white", font=("Segoe UI", 10, "bold"), width=14); badge.pack(side="left", padx=4, pady=3)
-info = tk.Label(bar, bg="#222", fg="#999", font=("Segoe UI", 9)); info.pack(side="left")
+info = tk.Label(bar, bg="#222", fg="#999", font=("Segoe UI", 9), width=6, anchor="w"); info.pack(side="left")  # fixed width: a changing count must never resize the window
 top = tk.BooleanVar(value="--top" in sys.argv)
 tk.Checkbutton(bar, text="Pin", variable=top, command=lambda: root.attributes("-topmost", top.get()), bg="#222", fg="#ccc",
                selectcolor="#222", activebackground="#222", activeforeground="#fff").pack(side="right")
@@ -157,6 +157,8 @@ def tick():
     if frame["n"] != shown["n"] and frame["jpg"]:
         try:
             im = Image.open(io.BytesIO(frame["jpg"])).convert("RGB"); w = int(im.width * H / im.height)
+            if w != shown["w"] and shown.get("locked"):  # phone rotated: let the window take its new natural size once, then pin again
+                shown["locked"] = None; root.geometry("")
             shown.update(img=ImageTk.PhotoImage(im.resize((w, H))), w=w, n=frame["n"]); img.configure(image=shown["img"], text="", width=w, height=H)
             stamps.append(now)
         except Exception:
@@ -166,7 +168,16 @@ def tick():
         pp.lock_release(ph, ME); last["mine"] = False
     st, who = pp.lock_status(ph, ME)
     badge.configure(text={"other": "Bot driving", "mine": "Your turn"}.get(st, "Idle: click to drive"), bg={"other": "#1d6fe0", "mine": "#1a9c4a"}.get(st, "#555"))
-    info.configure(text=("%d fps" % (len(stamps) / 2)) if now - frame["t"] < 3 else "no video: phone unlocked and connected?")
+    live = now - frame["t"] < 3
+    txt = ("%d fps" % (len(stamps) / 2)) if live else "offline"
+    if info.cget("text") != txt:
+        info.configure(text=txt)
+    ttl = "Phone Pilot - " + ph["name"] + ("" if live else "  (no video: phone unlocked and connected?)")
+    if root.title() != ttl:
+        root.title(ttl)
+    if shown["w"] and not shown.get("locked"):  # first frame sized the window: pin it so nothing in the bar can ever resize it
+        root.update_idletasks(); shown["locked"] = (root.winfo_width(), root.winfo_height())
+        root.geometry("%dx%d" % shown["locked"])
     root.after(40, tick)
 
 

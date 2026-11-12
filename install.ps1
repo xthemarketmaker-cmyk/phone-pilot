@@ -20,7 +20,7 @@ $Hashes = [ordered]@{
     "do.py" = "2f815878bbbdce82e66319afe123ece3eb8881c5f4bf18b07ebeecb61fc361e2"
     "doctor.py" = "7be802f0319f5b40d65af4ea1e39a16d97c15f455793e0c4d539dc0267394c25"
     "install_autostart.ps1" = "f76d68397ad9e59ee573eccf72600bc226dacb8dc9554b64c122bcf17ac71aee"
-    "phone_view.py" = "01d5cad64833d835c95f51d520c2853b2b4fc78fd179fcd1ad940b8fbd298e70"
+    "phone_view.py" = "aa5fd825bf70fd028128b22093ea407c5e5717ab697eaf5c370e676e94b66866"
     "pp.py" = "a56ee64fd25503f482094b35196648870a390dd4680a75141e2fa76aa024dd19"
 }
 function Fail($msg) { Write-Host "INSTALL STOPPED: $msg" -ForegroundColor Red; Write-Host "Nothing in $Dest was changed."; exit 1 }
