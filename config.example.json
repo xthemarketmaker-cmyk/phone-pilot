@@ -1,0 +1,27 @@
+{
+  "default_phone": "iphone",
+  "blocked_apps": [],
+  "phones": {
+    "iphone": {
+      "kind": "ios",
+      "udid": "<from ios list>",
+      "port": 8100,
+      "mjpeg": 9200,
+      "alias": "1",
+      "wda_bundle": "<CFBundleIdentifier ending in xctrunner>",
+      "signed": "YYYY-MM-DD",
+      "apple_id": "free"
+    },
+    "iphone2": {
+      "kind": "ios",
+      "udid": "<from ios list>",
+      "port": 8101,
+      "mjpeg": 9201,
+      "alias": "2"
+    },
+    "android": {
+      "kind": "android",
+      "serial": "<adb serial>"
+    }
+  }
+}
