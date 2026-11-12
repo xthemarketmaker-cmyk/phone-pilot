@@ -71,14 +71,60 @@ class Fail(Exception):
     pass
 
 
+def pid_alive(pid):
+    """True if process `pid` is running (Windows: OpenProcess + exit code; never signals or kills anything)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = ctypes.c_void_p
+        k.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        k.CloseHandle.argtypes = (ctypes.c_void_p,)
+        h = k.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.get_last_error() == 5   # access denied: it exists
+        try:
+            code = ctypes.c_ulong()
+            return bool(k.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def lock_holder(ph):
+    """who else holds this phone's lock, or None. A fresh lock (pp.STALE) of another owner (the live window,
+    PhoneLive-user) is busy. A PhoneBot lock written by another LIVE process (do.py / act.py / autolock.py of a second
+    bot or tester: "PhoneBot <time> <pid>") is busy too; before the pid was written two PhoneBot drivers both saw
+    "mine" and drove the phone at the same time. A bare "PhoneBot" (pp.py lock, held across calls) stays shareable."""
+    st, who = pp.lock_status(ph, LOCK_OWNER)
+    if st == "other":
+        return who
+    if st == "mine":
+        try:
+            parts = open(pp.lockfile(ph)).read().split()
+            pid = int(parts[2]) if len(parts) >= 3 else 0
+        except (OSError, ValueError):
+            pid = 0
+        if pid and pid != os.getpid() and pid_alive(pid):
+            return "%s (process %d)" % (LOCK_OWNER, pid)
+    return None
+
+
 class Phone:
     def __init__(self, name):
         ph = pp.pick(str(name) if name else None)       # config.json name or alias; none = default_phone / first iPhone
         self.name, self.port = ph["name"], ph["port"]
         self.alias = str(ph.get("alias") or ph["name"])
         self.ph, self.lock_ts = ph, 0
-        st_, who = pp.lock_status(ph, LOCK_OWNER)
-        if st_ == "other":   # the live viewer (or another bot) is driving this phone: never fight it
+        who = lock_holder(ph)
+        if who:   # the live viewer, or another PhoneBot process (a second bot / tester), is driving this phone: never fight it
             raise Fail("busy: %s is driving this phone (lock %s), nothing was pressed" % (who, os.path.basename(pp.lockfile(ph))))
         self.lock_refresh(True)
         atexit.register(self.lock_free)
@@ -94,11 +140,17 @@ class Phone:
 
     def lock_refresh(self, force=False):
         if force or time.time() - self.lock_ts > 30:
-            pp.lock_write(self.ph, LOCK_OWNER + " " + str(int(time.time())))
+            pp.lock_write(self.ph, "%s %d %d" % (LOCK_OWNER, time.time(), os.getpid()))   # owner, time, process id
             self.lock_ts = time.time()
 
     def lock_free(self):
-        pp.lock_release(self.ph, LOCK_OWNER)
+        """release only our own lock (same owner and, when the file names one, this process id)."""
+        try:
+            parts = open(pp.lockfile(self.ph)).read().split()
+        except OSError:
+            return
+        if parts[:1] == [LOCK_OWNER] and (len(parts) < 3 or parts[2] == str(os.getpid())):
+            pp.lock_release(self.ph, LOCK_OWNER)
 
     def mark(self, k):
         n = time.time()

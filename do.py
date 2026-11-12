@@ -2,15 +2,24 @@
 """do.py - generic fast iPhone primitives for tasks nobody scripted. One Shell call -> one JSON line.
   do.py [--phone 17|14] [--home] [--allow-risky] CMD ARGS...
   do.py [--phone 17] chain "open settings; tap_label General; tap_label About; read --contains iOS"
-Quoting: ';' inside quotes ("type 'a; b'") or written as \\; does not split a chain. `--` ends flags. type takes its
+  do.py [--phone 17] chain --steps-file C:\\phonebot\\logs\\steps.txt   (one step per line; ';' and quotes in a type line
+                                                                  are typed as written; # comments)
+  "open settings`ntype a; b" | python do.py chain -              (the same, steps from stdin)
+Quoting: ';' inside {braces} ("type {a; b}"), inside quotes ("type 'a; b'") or written as \\; does not split a chain.
+  Braces only open at the start of a word and are removed: type {a; b} types "a; b". Windows PowerShell 5.1 strips
+  double quotes inside a single-quoted argument ('type "a;b"' arrives as type a;b and splits): use braces,
+  --steps-file, or doubled single quotes ('type ''a; b'''). `--` ends flags. type takes its
   text literally (only --clear / --enter are flags, so "-5 deg" and "well - ok" type as written). type --clear alone
   just empties the field. A chain stops at the first failed step but still goes Home if it ends with home.
-Commands: open APP|BUNDLE, open_url URL, tap_label TEXT [--nth N] [--type T] [--timeout S], tap X Y,
+Commands: open APP|BUNDLE, open_url URL, tap_label TEXT [--nth N | --last] [--type T] [--timeout S], tap X Y,
   type TEXT [--clear] [--enter], read [--contains S] [--limit N] [--no-rects] [--xml] [--all], wait_for TEXT [--timeout S],
   back, scroll up|down [--px N], home, wait MS, tap_rel FX FY, tap_nth TYPE N, dismiss, hide_keyboard, shot PATH, close_tab (the Safari tab open_url opened; open_url reuses it)
 Speed: every lookup is ONE light XML dump (source with the costly attributes such as `visible` excluded:
   ~60-250 ms instead of 0.3-6 s) filtered by on-screen rect, then a coordinate tap at the element centre.
-  snapshotMaxDepth is raised only inside this process and restored to 1 in finally (Phone Panel needs 1)."""
+  snapshotMaxDepth is raised only inside this process and restored to 1 in finally (Phone Panel needs 1).
+tap_label duplicates: the JSON says matches: N (on-screen copies of the label). --nth N counts top to bottom, --last is
+  the bottom-most. With neither, a copy inside a Recent/Suggestions section (an ancestor named so, or a section
+  header above it in the same list) is skipped when another copy exists."""
 import sys, os, re, json, time, html, shlex, argparse, hashlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -21,7 +30,10 @@ import act
 from act import Fail
 
 EXCL = "visible,accessible,enabled,index,placeholderValue,selected,hittable,traits,focused"
-TAG = re.compile(r"<XCUIElementType(\w+)\s([^>]*?)/?>")
+NODE = re.compile(r"<(/?)XCUIElementType(\w+)([^>]*?)(/?)>")   # open, close and self-closing tags: keeps the tree
+BOXES = ("Table", "CollectionView", "ScrollView")
+SUGG = re.compile(r"(?i)^\s*(siri\s+)?(suggestions?|suggested(\s+\w+)?|recents?|recently(\s+\w+)*|recent(\s+\w+)?)\s*$")
+SUGG_ANY = re.compile(r"(?i)suggest|recent")
 ATTR = re.compile(r'(\w+)="([^"]*)"')
 APPS = dict(act.APP_NAMES, settings="com.apple.Preferences", appstore="com.apple.AppStore", **{"app store": "com.apple.AppStore"},
             youtube="com.google.ios.youtube", safari="com.apple.mobilesafari", clock="com.apple.mobiletimer", calculator="com.apple.calculator",
@@ -51,6 +63,32 @@ PRIO = {"StaticText": 0, "Key": 1, "Cell": 2, "Button": 3, "Link": 4, "Icon": 5,
 FOLD = str.maketrans({"\u2019": "'", "\u2018": "'", "\u201c": '"', "\u201d": '"', "\u00a0": " ", "\u2013": "-", "\u2014": "-"})
 INTERACTIVE = ("Button", "Cell", "Image", "Switch", "Link", "Icon", "SearchField", "TextField", "SegmentedControl", "Slider")
 SAFE_DISMISS = ("Not Now", "Not now", "Close", "Cancel", "Dismiss", "Maybe Later", "Later", "Remind Me Later")   # "No Thanks" can be a real choice (e.g. "Restore All Downloads?"): ask
+
+
+def parse_tree(xml, W, H):
+    """flat element list from a WDA XML source, each with its parent index (pi), nearest Table/CollectionView/ScrollView
+    (box) and nearest Cell inside that box (cell); i = own index."""
+    els, stack = [], []
+    for m in NODE.finditer(xml):
+        if m.group(1):   # </XCUIElementType...>
+            if stack:
+                stack.pop()
+            continue
+        a = {k: html.unescape(v) for k, v in ATTR.findall(m.group(3))}
+        try:
+            x, y, w, h = (float(a.get(k, 0)) for k in ("x", "y", "width", "height"))
+        except ValueError:
+            x = y = w = h = 0.0
+        a["t"], a["r"] = m.group(2), (x, y, w, h)
+        a["on"] = w > 0 and h > 0 and x + w > 0 and y + h > 0 and x < W and y < H
+        pi = stack[-1] if stack else -1
+        a["i"], a["pi"] = len(els), pi
+        a["box"] = a["i"] if a["t"] in BOXES else (els[pi]["box"] if pi >= 0 else -1)
+        a["cell"] = a["i"] if a["t"] == "Cell" else (-1 if a["t"] in BOXES or pi < 0 else els[pi]["cell"])
+        els.append(a)
+        if not m.group(4):
+            stack.append(a["i"])
+    return els
 
 
 class Do:
@@ -129,16 +167,7 @@ class Do:
             self.busy_set = True
         self.p.depth(depth or APP_DEPTH.get(self.app, 50))
         xml = self.p.call("GET", "/source?format=xml" + ("" if full else "&excluded_attributes=" + EXCL), timeout=60)
-        els = []
-        for m in TAG.finditer(xml):
-            a = {k: html.unescape(v) for k, v in ATTR.findall(m.group(2))}
-            try:
-                x, y, w, h = (float(a.get(k, 0)) for k in ("x", "y", "width", "height"))
-            except ValueError:
-                continue
-            a["t"], a["r"] = m.group(1), (x, y, w, h)
-            a["on"] = w > 0 and h > 0 and x + w > 0 and y + h > 0 and x < self.W and y < self.H
-            els.append(a)
+        els = parse_tree(xml, self.W, self.H)
         self.last_dump_ms = int((time.time() - t) * 1000)
         if self.last_dump_ms > BUSY_MS:
             self.mark_busy(self.last_dump_ms)
@@ -179,7 +208,64 @@ class Do:
             prev = s
         return None
 
-    def find_label(self, text, nth=1, typ=None, els=None):
+    def in_suggestions(self, e, els):
+        """True if element e sits in a Recent/Suggestions section: an ancestor (other than its own row) named or
+        labelled so, or its section header says so. The section header is found by walking up the run of touching
+        rows above e's row: a header row (a Cell with text but no Button/Link/Switch, as Settings' search shows
+        "Suggestions" / "Recent") ends the walk; a gap ends it too, and then a loose text just above is the header."""
+        own = self.text(e).lower()
+        j = e.get("pi", -1)
+        while j >= 0:
+            p = els[j]
+            if p["t"] not in ("Application", "Window"):
+                t = "%s %s" % (p.get("name") or "", p.get("label") or "")
+                if SUGG_ANY.search(t) and not (own and own in t.lower()):
+                    return True
+            j = p.get("pi", -1)
+        box = e.get("box", -1)
+        if box < 0:
+            return False
+        cells = {c["i"]: [c["r"][1], c["r"][1] + c["r"][3], [], False] for c in els if c["t"] == "Cell" and c.get("box") == box and c["r"][3] > 0}
+        for x in els:   # texts and interactive children per row
+            ci = x.get("cell", -1)
+            if ci in cells and x["i"] != ci:
+                if x["t"] in ("Button", "Link", "Switch", "TextField", "SearchField"):
+                    cells[ci][3] = True
+                elif x["t"] == "StaticText" and self.text(x):
+                    cells[ci][2].append(self.text(x))
+        top = els[e["cell"]]["r"][1] if e.get("cell", -1) in cells else e["r"][1]
+        mine = e.get("cell", -1)
+        while True:
+            above = [(ci, c) for ci, c in cells.items() if ci != mine and c[0] < top and top - 6 <= c[1] <= top + 2]
+            if not above:
+                break
+            ci, c = max(above, key=lambda x: x[1][0])
+            if c[2] and not c[3]:   # a header row
+                return bool(SUGG.match(c[2][0]))
+            top, mine = c[0], ci
+        heads = [h for h in els if h.get("box") == box and h.get("cell", -1) < 0 and h["t"] in ("StaticText", "Other")
+                 and h["i"] != box and self.text(h) and "scroll bar" not in self.text(h).lower()
+                 and top - 70 <= h["r"][1] + h["r"][3] <= top + 2]
+        return any(SUGG.match(self.text(h)) for h in heads)
+
+    def covered(self, e, els):
+        """True if a list drawn later (a search/suggestions overlay) has a row right where e is: e is behind it.
+        The light dump has no `visible`, and Settings keeps its main list 'on screen' under the search overlay."""
+        cx, cy = e["r"][0] + e["r"][2] / 2, e["r"][1] + e["r"][3] / 2
+        anc, j = set(), e.get("pi", -1)
+        while j >= 0:
+            anc.add(j); j = els[j].get("pi", -1)
+        for b in els:
+            if b["i"] <= e["i"] or b["t"] not in BOXES or b["i"] in anc or not b["on"]:
+                continue
+            if any(c["t"] == "Cell" and c.get("box") == b["i"] and c["on"] and c["r"][0] <= cx <= c["r"][0] + c["r"][2]
+                   and c["r"][1] <= cy <= c["r"][1] + c["r"][3] for c in els[b["i"]:]):
+                return True
+        return False
+
+    def find_label(self, text, nth=None, typ=None, els=None, last=False):
+        """-> (element, match level, on-screen copies, how picked). nth counts top to bottom; last = bottom-most;
+        neither: the top-most copy that is not in a Recent/Suggestions section (when there is more than one)."""
         els = els if els is not None else self.dump()
         cand = [e for e in els if e["on"] and (self.text(e) or e.get("name")) and e["t"] not in ("Application", "Window", "Switch", "Slider") and (not typ or e["t"] == typ)]
         F = lambda x: x.translate(FOLD).lower()   # curly quotes / NBSP / dashes as typed vs as shown ("What\u2019s new")
@@ -199,9 +285,21 @@ class Do:
                         uniq.append(e)
                     elif PRIO.get(e["t"], 9) < PRIO.get(dup["t"], 9):
                         uniq[uniq.index(dup)] = e
-                if len(uniq) >= nth:
-                    return uniq[nth - 1], lvl, len(uniq)
-        return None, 0, 0
+                if last:
+                    return uniq[-1], lvl, len(uniq), "last"
+                if nth:
+                    if len(uniq) >= nth:
+                        return uniq[nth - 1], lvl, len(uniq), "nth"
+                    continue
+                if len(uniq) > 1:
+                    shown = [u for u in uniq if not self.covered(u, els)] or uniq   # never prefer a copy hidden under an overlay
+                    real = [u for u in shown if not self.in_suggestions(u, els)]
+                    if real and len(real) < len(uniq):
+                        return real[0], lvl, len(uniq), "skipped-suggestions"
+                    if len(shown) < len(uniq):
+                        return shown[0], lvl, len(uniq), "skipped-covered"
+                return uniq[0], lvl, len(uniq), "first"
+        return None, 0, 0, None
 
     # ---- commands
     def c_open(self, a):
@@ -257,7 +355,7 @@ class Do:
 
     def c_tap_label(self, a):
         text = " ".join(a.rest)
-        if self.busy() and not a.fresh_lookup and not RISKY.match(text) and a.nth == 1:
+        if self.busy() and not a.fresh_lookup and not RISKY.match(text) and not a.nth and not a.last:
             hit = self.layout.get(self.key() + "|tapped", {}).get(text) or self.layout.get(self.key(), {}).get(text)
             if hit:   # busy app: skip the (10 s+) dump, tap the cached centre
                 self.p.tap(hit[0], hit[1])
@@ -267,7 +365,7 @@ class Do:
         scrolls, prev, stable, since = 0, None, 0, 0
         while True:
             els = self.dump()
-            e, lvl, n = self.find_label(text, a.nth, a.type, els)
+            e, lvl, n, how = self.find_label(text, a.nth, a.type, els, a.last)
             sg = self.sig(els)
             stable = stable + 1 if sg == prev else 0
             prev = sg
@@ -276,7 +374,7 @@ class Do:
                     # iOS spends the first tap on a list that is still (invisibly) decelerating on stopping it: let it rest
                     time.sleep(0.35)
                     els = self.dump()
-                    e, lvl, n = self.find_label(text, a.nth, a.type, els)
+                    e, lvl, n, how = self.find_label(text, a.nth, a.type, els, a.last)
                     if not e:
                         continue
                 break
@@ -318,12 +416,12 @@ class Do:
             if (after is None and e["t"] in ("StaticText", "Cell")) or same is not None:
                 # nothing changed: the tap was swallowed (list still gliding, keyboard closing). Re-find and tap once more.
                 els2 = self.dump()
-                e2, _, _ = self.find_label(text, a.nth, a.type, els2)
+                e2 = self.find_label(text, a.nth, a.type, els2, a.last)[0]
                 if e2:
                     x, y, w, h = e2["r"]
                     self.p.tap(x + w / 2, y + h / 2)
                     retap = self.settle(self.sig(els2)) is not None
-        return {"ok": True, **({"retapped": retap} if retap else {}), "scrolled": scrolls, "tapped": lab[:60], "type": e["t"], "match": ["", "exact", "id", "contains", "icase", "id-icase"][lvl], "of": n}
+        return {"ok": True, **({"retapped": retap} if retap else {}), "scrolled": scrolls, "tapped": lab[:60], "type": e["t"], "match": ["", "exact", "id", "contains", "icase", "id-icase"][lvl], "matches": n, **({"picked": how} if n > 1 else {})}
 
     def c_tap(self, a):
         x, y = float(a.rest[0]), float(a.rest[1])
@@ -681,36 +779,60 @@ class StepParser(argparse.ArgumentParser):
 
 
 def split_chain(s):
-    """split a chain on ';' but not inside quotes, and not when written as \\;. A quote only opens at the start of a
-    word, so an apostrophe inside a label (What's new) is plain text. An unclosed quote: split on every bare ';'."""
-    steps, cur, q, i = [], [], None, 0
+    """split a chain on ';' but not inside quotes or {braces}, and not when written as \\;. A quote or brace only opens at
+    the start of a word, so an apostrophe inside a label (What's new) is plain text. Inside braces quotes are plain text
+    and braces nest. Unclosed quote or brace: split on every bare ';'."""
+    steps, cur, q, br, i = [], [], None, 0, 0
     while i < len(s):
         ch = s[i]
         if ch == "\\" and i + 1 < len(s) and s[i + 1] == ";":
-            cur.append(";"); i += 2; continue
-        if q:
+            cur.append("\\;" if br or q else ";"); i += 2; continue
+        if br:
+            br += (ch == "{") - (ch == "}")
+        elif q:
             if ch == q:
                 q = None
+        elif ch == "{" and (not cur or cur[-1].isspace()):
+            br = 1
         elif ch in "'\"" and (not cur or cur[-1].isspace()):
             q = ch
         elif ch == ";":
             steps.append("".join(cur)); cur = []; i += 1; continue
         cur.append(ch); i += 1
-    if q:   # unbalanced quote: old behaviour (split on every ';' not escaped)
+    if q or br:   # unbalanced quote/brace: old behaviour (split on every ';' not escaped)
         return [x.replace("\x00", ";") for x in s.replace("\\;", "\x00").split(";")]
     steps.append("".join(cur))
     return steps
 
 
 def split_step(s):
-    """one step's words. Backslashes stay literal (Windows paths: shot C:\\phonebot\\logs\\s.png); an apostrophe in a
-    label ("What's new") falls back to plain whitespace splitting."""
+    """one step's words. {a; b} at the start of a word is one word, taken literally without the braces (braces nest;
+    quotes inside are plain text). Otherwise shell-style quotes; backslashes stay literal (Windows paths:
+    shot C:\\phonebot\\logs\\s.png); \\; is a plain ';'. An apostrophe in a label ("What's new") falls back to plain
+    whitespace splitting. An unclosed brace is plain text."""
+    groups, out, i = [], [], 0
+    while i < len(s):   # lift balanced brace groups out first, so quotes/apostrophes inside them never matter
+        if s[i] == "{" and (i == 0 or s[i - 1].isspace()):
+            d, j = 0, i
+            while j < len(s):
+                d += (s[j] == "{") - (s[j] == "}")
+                if d == 0:
+                    break
+                j += 1
+            if j < len(s):
+                groups.append(s[i + 1:j].replace("\\;", ";"))
+                out.append("\x01%d\x02" % (len(groups) - 1))
+                i = j + 1
+                continue
+        out.append(s[i]); i += 1
+    t = "".join(out).replace("\\;", ";")
     try:
-        lx = shlex.shlex(s, posix=True)
+        lx = shlex.shlex(t, posix=True)
         lx.whitespace_split, lx.escape, lx.commenters = True, "", ""
-        return list(lx)
+        words = list(lx)
     except ValueError:
-        return s.split()
+        words = t.split()
+    return [re.sub("\x01(\\d+)\x02", lambda m: groups[int(m.group(1))], w) for w in words]
 
 
 def parse_step(sp, s):
@@ -731,11 +853,46 @@ def parse_step(sp, s):
     return sp.parse_args(s)
 
 
+def file_step(line):
+    """one line of a steps file / stdin. A type line is literal text: quotes, ';' and dashes are typed as written (only
+    the words --clear / --enter are flags); {braces} still work. Other commands use the normal word rules."""
+    w = line.split(None, 1)
+    if w[0] == "type" and len(w) > 1 and not w[1].lstrip().startswith("{"):
+        return ["type"] + w[1].split()
+    return split_step(line)
+
+
+def chain_steps(args):
+    """chain "a; b; c" | chain --steps-file PATH | chain -  (stdin). From a file or stdin every line is one step, ';'
+    is plain text and a type line is typed exactly as written (no shell quoting at all); blank lines and lines starting
+    with # are skipped."""
+    if args[:1] == ["-"] or args[:1] == ["--steps-file"]:
+        if args[:1] == ["-"]:
+            raw = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read().encode("utf-8")
+        else:
+            if len(args) < 2:
+                raise ValueError("--steps-file needs a path")
+            raw = open(args[1], "rb").read()
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):   # PowerShell 5 Out-File / > writes UTF-16 with a BOM
+            txt = raw.decode("utf-16")
+        else:
+            try:
+                txt = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                txt = raw.decode("cp1252", "replace")   # Set-Content's ANSI default
+        lines = [l.strip() for l in txt.replace("\x00", "").splitlines()]
+        steps = [file_step(l) for l in lines if l and not l.startswith("#")]
+    else:
+        steps = [split_step(s) for s in split_chain(" ".join(args)) if s.strip()]
+    return [s for s in steps if s]
+
+
 def parser():
     sp = StepParser(prog="step", add_help=False)
     sp.add_argument("cmd")
     sp.add_argument("rest", nargs="*")
-    sp.add_argument("--nth", type=int, default=1)
+    sp.add_argument("--nth", type=int, default=None)
+    sp.add_argument("--last", action="store_true", help="tap_label: the bottom-most on-screen copy of the label")
     sp.add_argument("--type")
     sp.add_argument("--timeout", type=float, default=4.0)
     sp.add_argument("--clear", action="store_true")
@@ -767,8 +924,10 @@ def main():
     if not argv:
         print(__doc__); sys.exit(2)
     if argv[0] == "chain":
-        steps = [split_step(s) for s in split_chain(" ".join(argv[1:])) if s.strip()]
-        steps = [s for s in steps if s]
+        try:
+            steps = chain_steps(argv[1:])
+        except (OSError, ValueError) as e:
+            print(json.dumps({"ok": False, "error": "chain: %s" % e})); sys.exit(1)
     else:
         steps = [argv]
     sp = parser()
